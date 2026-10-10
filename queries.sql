@@ -140,3 +140,115 @@ SELECT bill_date,
        ROUND(SUM(daily_sales) OVER (ORDER BY bill_date), 2) AS running_total
 FROM daily
 ORDER BY bill_date;
+
+-- Q10: How are bill values distributed (min, quartiles, median, 90th percentile, max)?
+WITH bill_totals AS (
+    SELECT b.bill_number,
+           SUM(sl.net_amount) AS bill_value
+    FROM bills b
+    JOIN sale_lines sl ON sl.bill_number = b.bill_number
+    WHERE b.record_type = 'Sale'
+      AND b.retailer_id <> 'R258'
+    GROUP BY b.bill_number
+)
+SELECT COUNT(*)                                                                      AS bills,
+       ROUND(MIN(bill_value), 2)                                                     AS min_bill,
+       ROUND((PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY bill_value))::numeric, 2) AS q1,
+       ROUND((PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY bill_value))::numeric, 2) AS median,
+       ROUND((PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY bill_value))::numeric, 2) AS q3,
+       ROUND((PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY bill_value))::numeric, 2) AS p90,
+       ROUND(MAX(bill_value), 2)                                                     AS max_bill,
+       ROUND(AVG(bill_value), 2)                                                     AS mean
+FROM bill_totals;
+
+-- Q11: Which bills are unusually large (IQR method)?
+WITH bill_totals AS (
+    SELECT b.bill_number,
+           b.retailer_id,
+           SUM(sl.net_amount) AS bill_value
+    FROM bills b
+    JOIN sale_lines sl ON sl.bill_number = b.bill_number
+    WHERE b.record_type = 'Sale'
+      AND b.retailer_id <> 'R258'
+    GROUP BY b.bill_number, b.retailer_id
+),
+quartiles AS (
+    SELECT PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY bill_value) AS q1,
+           PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY bill_value) AS q3
+    FROM bill_totals
+),
+fences AS (
+    SELECT q3 + 1.5 * (q3 - q1) AS upper_fence
+    FROM quartiles
+)
+SELECT bt.bill_number,
+       bt.retailer_id,
+       ROUND(bt.bill_value, 2)           AS bill_value,
+       ROUND(f.upper_fence::numeric, 2)  AS upper_fence
+FROM bill_totals bt
+CROSS JOIN fences f
+WHERE bt.bill_value > f.upper_fence
+ORDER BY bt.bill_value DESC;
+
+-- Q11b: How much of the business do the outlier bills represent?
+WITH bill_totals AS (
+    SELECT b.bill_number, SUM(sl.net_amount) AS bill_value
+    FROM bills b
+    JOIN sale_lines sl ON sl.bill_number = b.bill_number
+    WHERE b.record_type = 'Sale'
+      AND b.retailer_id <> 'R258'
+    GROUP BY b.bill_number
+),
+fences AS (
+    SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY bill_value)
+           + 1.5 * (PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY bill_value)
+                  - PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY bill_value)) AS upper_fence
+    FROM bill_totals
+)
+SELECT COUNT(*) FILTER (WHERE bill_value > upper_fence)                                      AS outlier_bills,
+       COUNT(*)                                                                              AS total_bills,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE bill_value > upper_fence) / COUNT(*), 1)         AS pct_of_bills,
+       ROUND(100.0 * SUM(bill_value) FILTER (WHERE bill_value > upper_fence) / SUM(bill_value), 1) AS pct_of_sales
+FROM bill_totals
+CROSS JOIN fences;
+
+-- Q12: How much do bill values vary per salesman (std dev and coefficient of variation)?
+WITH bill_totals AS (
+    SELECT b.bill_number,
+           b.retailer_id,
+           SUM(sl.net_amount) AS bill_value
+    FROM bills b
+    JOIN sale_lines sl ON sl.bill_number = b.bill_number
+    WHERE b.record_type = 'Sale'
+      AND b.retailer_id <> 'R258'
+    GROUP BY b.bill_number, b.retailer_id
+)
+SELECT s.sm_name,
+       COUNT(*)                                                       AS bills,
+       ROUND(AVG(bt.bill_value), 2)                                   AS avg_bill,
+       ROUND(STDDEV(bt.bill_value), 2)                                AS std_dev,
+       ROUND(STDDEV(bt.bill_value) / AVG(bt.bill_value) * 100, 1)     AS cv_pct
+FROM bill_totals bt
+JOIN retailers r ON r.retailer_id = bt.retailer_id
+JOIN routes rt   ON rt.route_code = r.route_code
+JOIN salesmen s  ON s.sm_code     = rt.sm_code
+GROUP BY s.sm_name
+ORDER BY avg_bill DESC;
+
+-- Q13: Do bigger bills get a higher discount?
+WITH bill_stats AS (
+    SELECT b.bill_number,
+           SUM(sl.gross)                                       AS gross_value,
+           SUM(sl.scheme_disc + sl.key_disc + sl.rd_wsh_disc)  AS total_discount
+    FROM bills b
+    JOIN sale_lines sl ON sl.bill_number = b.bill_number
+    WHERE b.record_type = 'Sale'
+      AND b.retailer_id <> 'R258'
+    GROUP BY b.bill_number
+)
+SELECT COUNT(*)                                                                                       AS bills,
+       ROUND(CORR(total_discount, gross_value)::numeric, 3)                                           AS corr_discount_amount_vs_bill_size,
+       ROUND(CORR(100.0 * total_discount / NULLIF(gross_value, 0), gross_value)::numeric, 3)          AS corr_discount_pct_vs_bill_size
+FROM bill_stats;
+
+
